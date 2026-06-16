@@ -1,0 +1,12 @@
+# Binaries
+/yt-transcript
+*.exe
+*.out
+
+# Go
+/vendor/
+*.test
+
+# Local / editor
+.claude/
+.DS_Store
