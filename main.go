@@ -64,15 +64,12 @@ const (
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	// Valeurs de repli si on ne parvient pas à les extraire de la page.
 	defaultClientVersion = "2.20240814.00.00"
-	// Clé publique InnerTube (présente dans toute page YouTube).
-	defaultAPIKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-	// Le client ANDROID renvoie des URLs de sous-titres directement
-	// téléchargeables (sans « Proof of Origin Token »), contrairement au
-	// client WEB dont les URLs portent le marqueur exp=xpe.
-	androidClientName    = "ANDROID"
-	androidClientVersion = "20.10.38"
-	maxChannelPages      = 200 // garde-fou anti-boucle pour la pagination
-	fetchWorkers         = 6   // transcripts récupérés en parallèle
+	// Clé publique InnerTube (présente dans toute page YouTube). Ce n'est pas
+	// une clé personnelle : YouTube l'expose dans le code de chaque page et elle
+	// suffit pour l'endpoint /youtubei/v1/player.
+	defaultAPIKey   = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+	maxChannelPages = 200 // garde-fou anti-boucle pour la pagination
+	fetchWorkers    = 6   // transcripts récupérés en parallèle
 )
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -479,28 +476,142 @@ func getTranscript(ctx context.Context, videoID, lang string) VideoTranscript {
 	return res
 }
 
-// fetchPlayerResponse interroge l'API InnerTube avec le client ANDROID, dont la
-// réponse fournit des URLs de sous-titres directement exploitables.
-func fetchPlayerResponse(ctx context.Context, videoID string) (*playerResponse, error) {
-	payload := map[string]any{
-		"context": map[string]any{
-			"client": map[string]any{
-				"clientName":    androidClientName,
-				"clientVersion": androidClientVersion,
-				"hl":            "en",
-				"gl":            "US",
-			},
+// innertubeClient décrit l'identité d'un client envoyée à l'API InnerTube.
+//
+// YouTube applique des contrôles anti-bot qui varient selon le client : le
+// client « ANDROID » classique exige désormais une connexion (« Sign in to
+// confirm you're not a bot », playabilityStatus = LOGIN_REQUIRED). On essaie
+// donc plusieurs clients à la suite jusqu'à en trouver un qui renvoie une
+// réponse exploitable sans authentification — si YouTube en ferme un, les
+// autres prennent le relais.
+type innertubeClient struct {
+	name      string         // clientName envoyé dans le contexte
+	version   string         // clientVersion
+	clientID  string         // en-tête X-YouTube-Client-Name (identifiant numérique)
+	userAgent string         // User-Agent cohérent avec le client
+	extra     map[string]any // champs additionnels du contexte client
+}
+
+// Ordre de préférence : les clients les moins susceptibles d'exiger une
+// connexion ou un « Proof of Origin Token » en premier.
+var innertubeClients = []innertubeClient{
+	{
+		name:      "ANDROID_VR",
+		version:   "1.61.48",
+		clientID:  "28",
+		userAgent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+		extra: map[string]any{
+			"androidSdkVersion": 32,
+			"deviceMake":        "Oculus",
+			"deviceModel":       "Quest 3",
+			"osName":            "Android",
+			"osVersion":         "12L",
 		},
-		"videoId": videoID,
+	},
+	{
+		name:      "IOS",
+		version:   "20.10.4",
+		clientID:  "5",
+		userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
+		extra: map[string]any{
+			"deviceMake":  "Apple",
+			"deviceModel": "iPhone16,2",
+			"osName":      "iPhone",
+			"osVersion":   "18.3.2.22D82",
+		},
+	},
+	{
+		name:      "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+		version:   "2.0",
+		clientID:  "85",
+		userAgent: "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+	},
+	{
+		name:      "MWEB",
+		version:   "2.20250606.01.00",
+		clientID:  "2",
+		userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+	},
+}
+
+// fetchPlayerResponse interroge l'API InnerTube en essayant plusieurs clients
+// et renvoie la première réponse exploitable. On privilégie une réponse qui
+// expose effectivement des pistes de sous-titres ; à défaut on garde la
+// première réponse jouable rencontrée.
+func fetchPlayerResponse(ctx context.Context, videoID string) (*playerResponse, error) {
+	var lastErr error
+	var fallback *playerResponse
+	for _, c := range innertubeClients {
+		pr, err := playerWithClient(ctx, videoID, c)
+		if err != nil {
+			lastErr = fmt.Errorf("client %s: %w", c.name, err)
+			continue
+		}
+		if st := pr.PlayabilityStatus.Status; st != "" && st != "OK" {
+			// LOGIN_REQUIRED, ERROR, UNPLAYABLE… : ce client est bloqué ou la
+			// vidéo est indisponible pour lui, on tente le suivant.
+			lastErr = fmt.Errorf("client %s: %s %s", c.name, st,
+				strings.TrimSpace(pr.PlayabilityStatus.Reason))
+			continue
+		}
+		if len(pr.Captions.PlayerCaptionsTracklistRenderer.CaptionTracks) > 0 {
+			return pr, nil
+		}
+		if fallback == nil {
+			fallback = pr
+		}
 	}
-	body, err := httpPostJSON(ctx,
-		"https://www.youtube.com/youtubei/v1/player?key="+defaultAPIKey, payload)
+	if fallback != nil {
+		return fallback, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("aucun client InnerTube n'a renvoyé de réponse exploitable")
+	}
+	return nil, lastErr
+}
+
+// playerWithClient effectue l'appel /youtubei/v1/player avec l'identité d'un
+// client donné (contexte + en-têtes cohérents).
+func playerWithClient(ctx context.Context, videoID string, c innertubeClient) (*playerResponse, error) {
+	client := map[string]any{
+		"clientName":    c.name,
+		"clientVersion": c.version,
+		"hl":            "en",
+		"gl":            "US",
+	}
+	for k, v := range c.extra {
+		client[k] = v
+	}
+	payload := map[string]any{
+		"context":        map[string]any{"client": client},
+		"videoId":        videoID,
+		"contentCheckOk": true,
+		"racyCheckOk":    true,
+	}
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://www.youtube.com/youtubei/v1/player?key="+defaultAPIKey, bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("X-YouTube-Client-Name", c.clientID)
+	req.Header.Set("X-YouTube-Client-Version", c.version)
+	req.Header.Set("Origin", "https://www.youtube.com")
+	req.Header.Set("Cookie", "CONSENT=YES+cb.20210328-17-p0.en+FX+000")
+
+	body, err := doString(req)
 	if err != nil {
 		return nil, err
 	}
 	var pr playerResponse
 	if err := json.Unmarshal([]byte(body), &pr); err != nil {
-		return nil, fmt.Errorf("unreadable player response: %w", err)
+		return nil, fmt.Errorf("réponse player illisible: %w", err)
 	}
 	return &pr, nil
 }
